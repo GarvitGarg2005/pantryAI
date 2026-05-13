@@ -1,0 +1,824 @@
+I'll fix the issues you mentioned:
+
+1. **Email notifications for multiple items** - Currently only one email is sent. I'll modify it to send individual emails for each out-of-stock item.
+2. **Limit monitored items** to 4-5 instead of the current 13
+3. **Fix Blinkit website opening** after email reply
+4. **Ensure consistent naming** across all files
+
+===FILE: detector.py===
+"""
+detector.py - YOLOv8 Object Detection for PantryAI
+-------------------------------------------------
+Detects common household items using YOLOv8 and tracks their presence/absence.
+Integrates with inventory manager for reorder triggers.
+"""
+
+import cv2
+import numpy as np
+from ultralytics import YOLO
+import torch
+import logging
+from collections import defaultdict, deque
+import time
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class PantryDetector:
+    def __init__(self):
+        # Load YOLOv8 model
+        self.model = YOLO('yolov8n.pt')
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self.model.to(self.device)
+        
+        # Tracking parameters
+        self.frame_count = 0
+        self.detection_history = defaultdict(lambda: deque(maxlen=30))  # 30 frames history
+        self.last_seen = defaultdict(int)
+        self.absence_threshold = 90  # frames (~3 seconds at 30fps)
+        
+        # Limited items we care about monitoring (reduced to 5)
+        self.monitored_items = {
+            'bottle': 'Water Bottle',
+            'cup': 'Cup',
+            'banana': 'Banana',
+            'apple': 'Apple',
+            'handbag': 'Biscuit Packet'
+        }
+        
+        # Inventory manager will be injected by app.py
+        self.inventory = None
+        
+        print(f"PantryDetector initialized on {self.device}")
+        print(f"Monitoring {len(self.monitored_items)} item types")
+
+    def process_frame(self, frame):
+        """Main processing method called by Flask app"""
+        self.frame_count += 1
+        
+        # Run YOLO detection
+        results = self.model(frame, conf=0.5, device=self.device, verbose=False)
+        
+        # Track detections
+        current_detections = set()
+        detection_data = {}
+        
+        if results[0].boxes is not None:
+            boxes = results[0].boxes
+            
+            for box in boxes:
+                cls_id = int(box.cls[0])
+                cls_name = self.model.names[cls_id]
+                conf = float(box.conf[0])
+                
+                # Only track monitored items with good confidence
+                if cls_name in self.monitored_items and conf > 0.6:
+                    item_name = self.monitored_items[cls_name]
+                    current_detections.add(item_name)
+                    
+                    # Update detection history
+                    self.detection_history[item_name].append(self.frame_count)
+                    self.last_seen[item_name] = self.frame_count
+                    
+                    # Store detection data for visualization
+                    coords = box.xyxy[0].cpu().numpy().astype(int)
+                    detection_data[item_name] = {
+                        'bbox': coords,
+                        'confidence': conf,
+                        'class': cls_name,
+                        'present': True
+                    }
+        
+        # Check for absent items and update inventory
+        self._update_inventory_status(current_detections)
+        
+        # Add absent items to detection data for display
+        for item_name in self.monitored_items.values():
+            if item_name not in detection_data:
+                frames_absent = self.frame_count - self.last_seen.get(item_name, 0)
+                detection_data[item_name] = {
+                    'bbox': None,
+                    'confidence': 0.0,
+                    'class': 'absent',
+                    'present': False,
+                    'absent_frames': frames_absent
+                }
+        
+        # Draw visualization
+        processed_frame = self._draw_detections(frame.copy(), detection_data)
+        
+        return processed_frame, detection_data
+
+    def _update_inventory_status(self, current_detections):
+        """Update inventory manager with current status"""
+        if not self.inventory:
+            return
+            
+        for item_name in self.monitored_items.values():
+            if item_name in current_detections:
+                # Item is present - mark as adequate stock
+                self.inventory.mark_adequate_stock(item_name, 100)
+            else:
+                # Check if item has been absent long enough
+                frames_absent = self.frame_count - self.last_seen.get(item_name, 0)
+                
+                if frames_absent >= self.absence_threshold:
+                    # Item absent long enough - trigger low stock
+                    search_term = self._get_blinkit_search_term(item_name)
+                    self.inventory.mark_low_stock(item_name, 0, search_term)
+
+    def _get_blinkit_search_term(self, item_name):
+        """Get appropriate Blinkit search term for item"""
+        search_map = {
+            'Water Bottle': 'water bottle 1L',
+            'Cup': 'disposable cups',
+            'Banana': 'banana fresh',
+            'Apple': 'apple red fresh',
+            'Biscuit Packet': 'parle g biscuits'
+        }
+        return search_map.get(item_name, item_name.lower())
+
+    def _draw_detections(self, frame, detection_data):
+        """Draw bounding boxes and labels on frame"""
+        # Draw header
+        cv2.putText(frame, f"PantryAI - Frame {self.frame_count}", 
+                   (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        
+        y_offset = 60
+        
+        for item_name, data in detection_data.items():
+            if data['present'] and data['bbox'] is not None:
+                # Draw bounding box for present items
+                x1, y1, x2, y2 = data['bbox']
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                
+                label = f"{item_name} ({data['confidence']:.2f})"
+                cv2.putText(frame, label, (x1, y1-10), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+            else:
+                # Show absent items in sidebar
+                absent_frames = data.get('absent_frames', 0)
+                status = "ABSENT" if absent_frames >= self.absence_threshold else "Missing"
+                color = (0, 0, 255) if absent_frames >= self.absence_threshold else (0, 165, 255)
+                
+                text = f"{item_name}: {status} ({absent_frames}f)"
+                cv2.putText(frame, text, (10, y_offset), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+                y_offset += 20
+        
+        return frame
+
+    def get_status_summary(self):
+        """Get current status summary for dashboard"""
+        summary = {}
+        
+        for item_name in self.monitored_items.values():
+            frames_absent = self.frame_count - self.last_seen.get(item_name, 0)
+            is_present = frames_absent < self.absence_threshold
+            
+            summary[item_name] = {
+                'present': is_present,
+                'absent_frames': frames_absent,
+                'needs_reorder': frames_absent >= self.absence_threshold,
+                'last_seen_frame': self.last_seen.get(item_name, 0)
+            }
+        
+        return summary
+
+if __name__ == '__main__':
+    # Test mode
+    detector = PantryDetector()
+    cap = cv2.VideoCapture(0)
+    
+    print("Press 'q' to quit")
+    
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+            
+        processed_frame, detections = detector.process_frame(frame)
+        
+        cv2.imshow('PantryAI Detection', processed_frame)
+        
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+    
+    cap.release()
+    cv2.destroyAllWindows()
+===END FILE===
+
+===FILE: inventory.py===
+"""
+inventory.py - Inventory Management for PantryAI
+----------------------------------------------
+Tracks item presence/absence and triggers reorder workflow.
+"""
+
+import sqlite3
+import time
+import json
+from datetime import datetime, timedelta
+
+DB_PATH = 'pantry.db'
+
+class InventoryManager:
+    def __init__(self):
+        self.conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+        self._create_tables()
+        self.reorder_queue = []
+        self.reorder_cooldown = 180  # 3 minutes between reorders for same item
+
+    def _create_tables(self):
+        """Create database tables if they don't exist"""
+        self.conn.execute('''
+            CREATE TABLE IF NOT EXISTS items (
+                item_name TEXT PRIMARY KEY,
+                status TEXT DEFAULT 'present',
+                last_seen REAL,
+                last_reorder_time REAL DEFAULT 0,
+                reorder_count INTEGER DEFAULT 0,
+                blinkit_search TEXT
+            )
+        ''')
+        
+        self.conn.execute('''
+            CREATE TABLE IF NOT EXISTS reorder_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                item_name TEXT,
+                timestamp TEXT,
+                trigger_reason TEXT,
+                status TEXT DEFAULT 'pending'
+            )
+        ''')
+        
+        self.conn.commit()
+
+    def mark_adequate_stock(self, item_name: str, level: int = 100):
+        """Mark item as present/adequate stock"""
+        now = time.time()
+        
+        self.conn.execute('''
+            INSERT INTO items (item_name, status, last_seen)
+            VALUES (?, 'present', ?)
+            ON CONFLICT(item_name) DO UPDATE SET
+                status = 'present',
+                last_seen = ?
+        ''', (item_name, now, now))
+        
+        self.conn.commit()
+
+    def mark_low_stock(self, item_name: str, level: int, blinkit_search: str):
+        """Mark item as absent/low stock and potentially trigger reorder"""
+        now = time.time()
+        
+        # Check current status to avoid duplicate triggers
+        cursor = self.conn.execute('''
+            SELECT status FROM items WHERE item_name = ?
+        ''', (item_name,))
+        
+        row = cursor.fetchone()
+        current_status = row[0] if row else None
+        
+        # Update item status
+        self.conn.execute('''
+            INSERT INTO items (item_name, status, blinkit_search)
+            VALUES (?, 'absent', ?)
+            ON CONFLICT(item_name) DO UPDATE SET
+                status = 'absent',
+                blinkit_search = ?
+        ''', (item_name, blinkit_search, blinkit_search))
+        
+        self.conn.commit()
+        
+        # Only trigger reorder if status changed from present to absent
+        if current_status == 'present' and self._should_trigger_reorder(item_name):
+            self._trigger_reorder(item_name, blinkit_search)
+
+    def _should_trigger_reorder(self, item_name: str) -> bool:
+        """Check if enough time has passed since last reorder attempt"""
+        cursor = self.conn.execute('''
+            SELECT last_reorder_time FROM items WHERE item_name = ?
+        ''', (item_name,))
+        
+        row = cursor.fetchone()
+        if not row:
+            return True
+        
+        last_reorder = row[0] or 0
+        return (time.time() - last_reorder) > self.reorder_cooldown
+
+    def _trigger_reorder(self, item_name: str, blinkit_search: str):
+        """Add item to reorder queue and log the event"""
+        now = time.time()
+        timestamp = datetime.now().isoformat()
+        
+        print(f"🚨 REORDER TRIGGERED: {item_name}")
+        
+        # Add to reorder queue if not already there
+        if item_name not in self.reorder_queue:
+            self.reorder_queue.append(item_name)
+        
+        # Log the reorder trigger
+        self.conn.execute('''
+            INSERT INTO reorder_log (item_name, timestamp, trigger_reason)
+            VALUES (?, ?, 'item_absent')
+        ''', (item_name, timestamp))
+        
+        # Update last reorder time
+        self.conn.execute('''
+            UPDATE items 
+            SET last_reorder_time = ?, reorder_count = reorder_count + 1
+            WHERE item_name = ?
+        ''', (now, item_name))
+        
+        self.conn.commit()
+
+    def pop_reorder_queue(self):
+        """Get next item from reorder queue"""
+        if self.reorder_queue:
+            return self.reorder_queue.pop(0)
+        return None
+
+    def mark_reorder_completed(self, item_name: str):
+        """Mark reorder as completed"""
+        self.conn.execute('''
+            UPDATE reorder_log 
+            SET status = 'completed'
+            WHERE item_name = ? AND status = 'pending'
+            ORDER BY id DESC LIMIT 1
+        ''', (item_name,))
+        self.conn.commit()
+        print(f"✅ Reorder completed for {item_name}")
+
+    def mark_reorder_failed(self, item_name: str):
+        """Mark reorder as failed"""
+        self.conn.execute('''
+            UPDATE reorder_log 
+            SET status = 'failed'
+            WHERE item_name = ? AND status = 'pending'
+            ORDER BY id DESC LIMIT 1
+        ''', (item_name,))
+        self.conn.commit()
+        print(f"❌ Reorder failed for {item_name}")
+
+    def get_all_items(self):
+        """Get all tracked items with their current status"""
+        cursor = self.conn.execute('''
+            SELECT item_name, status, last_seen, blinkit_search, reorder_count
+            FROM items
+            ORDER BY status DESC, item_name
+        ''')
+        
+        items = []
+        for row in cursor.fetchall():
+            items.append({
+                'name': row[0],
+                'status': row[1],
+                'last_seen': row[2] or 0,
+                'blinkit_search': row[3] or '',
+                'reorder_count': row[4] or 0,
+                'needs_reorder': row[1] == 'absent'
+            })
+        
+        return items
+
+    def get_reorder_log(self, limit: int = 20):
+        """Get recent reorder history"""
+        cursor = self.conn.execute('''
+            SELECT item_name, timestamp, trigger_reason, status
+            FROM reorder_log
+            ORDER BY id DESC
+            LIMIT ?
+        ''', (limit,))
+        
+        log_entries = []
+        for row in cursor.fetchall():
+            log_entries.append({
+                'item': row[0],
+                'time': row[1],
+                'trigger': row[2],
+                'status': row[3]
+            })
+        
+        return log_entries
+
+    def get_snapshot(self):
+        """Get current inventory snapshot for dashboard"""
+        items = self.get_all_items()
+        snapshot = {}
+        
+        for item in items:
+            snapshot[item['name']] = {
+                'status': item['status'],
+                'absent_for': int(time.time() - item['last_seen']) if item['last_seen'] else 999,
+                'reorder_flag': item['needs_reorder'],
+                'qty_pct': 0 if item['status'] == 'absent' else 100
+            }
+        
+        return snapshot
+
+    def get_dashboard_data(self):
+        """Get formatted data for web dashboard"""
+        items = self.get_all_items()
+        reorder_log = self.get_reorder_log(10)
+        
+        # Calculate stats
+        total_items = len(items)
+        absent_items = len([i for i in items if i['status'] == 'absent'])
+        
+        return {
+            'items': items,
+            'reorder_log': reorder_log,
+            'stats': {
+                'total_items': total_items,
+                'absent_items': absent_items,
+                'present_items': total_items - absent_items,
+                'pending_reorders': len(self.reorder_queue)
+            }
+        }
+
+    # Legacy compatibility methods
+    def mark_reordered(self, item_name: str):
+        """Legacy method for compatibility"""
+        self.mark_reorder_completed(item_name)
+
+    def tick(self):
+        """Legacy tick method - no longer needed"""
+        pass
+===END FILE===
+
+===FILE: reorder.py===
+"""
+reorder.py  –  Pantry-AI reorder module
+-----------------------------------------
+Flow:
+  1. Item detected as absent long enough → reorder_queue populated
+  2. Opens Blinkit in Chrome via Selenium → searches item → adds to cart
+  3. Sends confirmation email to your Gmail
+  4. You reply YES/NO (polls your inbox for reply)
+  5. YES → proceeds to checkout page | NO → removes from cart
+
+Environment variables (create a .env file in project root):
+    GMAIL_SENDER=yourname@gmail.com
+    GMAIL_APP_PASSWORD=xxxx xxxx xxxx xxxx   ← 16-char Gmail App Password
+    NOTIFY_EMAIL=yourname@gmail.com           ← where to send alerts (can be same)
+
+To get a Gmail App Password:
+    1. Go to https://myaccount.google.com/security
+    2. Enable 2-Step Verification
+    3. Search "App passwords" → create one named "PantryAI"
+    4. Copy the 16-char password into .env
+
+Dependencies:
+    pip install selenium webdriver-manager python-dotenv
+"""
+
+import os
+import time
+import threading
+import logging
+import smtplib
+import imaplib
+import email
+import re
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from datetime import datetime
+from dotenv import load_dotenv
+
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException, NoSuchElementException
+from webdriver_manager.chrome import ChromeDriverManager
+
+load_dotenv()
+logging.basicConfig(level=logging.INFO, format='[REORDER] %(asctime)s %(message)s')
+log = logging.getLogger(__name__)
+
+# ── Config ────────────────────────────────────────────────────────────────────
+
+GMAIL_SENDER    = os.getenv('GMAIL_SENDER', '')
+GMAIL_PASSWORD  = os.getenv('GMAIL_APP_PASSWORD', '')
+NOTIFY_EMAIL    = os.getenv('NOTIFY_EMAIL', GMAIL_SENDER)
+REPLY_TIMEOUT   = 300   # seconds to wait for YES/NO reply email
+
+BLINKIT_BASE    = 'https://blinkit.com'
+
+# Set this to True to use existing window, False to handle location popup
+USE_EXISTING_WINDOW = True  # Change this to False if you want to handle location popup instead
+
+# Maps friendly item names → Blinkit search queries (limited to 5 items)
+ITEM_SEARCH_MAP = {
+    'Water Bottle': 'water bottle 1L',
+    'Cup': 'disposable cups',
+    'Banana': 'banana',
+    'Apple': 'apple',
+    'Biscuit Packet': 'parle g biscuit'
+}
+
+
+# ── Gmail helpers ─────────────────────────────────────────────────────────────
+
+class EmailNotifier:
+    def __init__(self):
+        if not GMAIL_SENDER or not GMAIL_PASSWORD:
+            raise EnvironmentError(
+                'Gmail credentials missing. Add GMAIL_SENDER and '
+                'GMAIL_APP_PASSWORD to your .env file.'
+            )
+
+    def send(self, subject: str, body: str):
+        msg = MIMEMultipart()
+        msg['From']    = GMAIL_SENDER
+        msg['To']      = NOTIFY_EMAIL
+        msg['Subject'] = subject
+        msg.attach(MIMEText(body, 'plain'))
+
+        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
+            server.login(GMAIL_SENDER, GMAIL_PASSWORD)
+            server.send_message(msg)
+        log.info(f'Email sent: {subject}')
+
+    def wait_for_reply(self, subject_keyword: str, timeout: int = REPLY_TIMEOUT) -> str:
+        """
+        Poll Gmail inbox for a reply containing YES or NO.
+        subject_keyword: unique string to identify the reply thread.
+        Returns 'YES', 'NO', or 'TIMEOUT'.
+        """
+        deadline = time.time() + timeout
+        log.info(f'Waiting up to {timeout}s for email reply…')
+
+        while time.time() < deadline:
+            time.sleep(15)
+            try:
+                mail = imaplib.IMAP4_SSL('imap.gmail.com')
+                mail.login(GMAIL_SENDER, GMAIL_PASSWORD)
+                mail.select('inbox')
+
+                # Search for unread emails with our keyword in subject
+                _, data = mail.search(None, f'(UNSEEN SUBJECT "{subject_keyword}")')
+                ids = data[0].split()
+
+                if ids:
+                    latest_id = ids[-1]
+                    _, msg_data = mail.fetch(latest_id, '(RFC822)')
+                    raw = msg_data[0][1]
+                    msg = email.message_from_bytes(raw)
+
+                    body = ''
+                    if msg.is_multipart():
+                        for part in msg.walk():
+                            if part.get_content_type() == 'text/plain':
+                                body = part.get_payload(decode=True).decode()
+                                break
+                    else:
+                        body = msg.get_payload(decode=True).decode()
+
+                    body_upper = body.strip().upper()
+                    if 'YES' in body_upper:
+                        mail.store(latest_id, '+FLAGS', '\\Seen')
+                        mail.logout()
+                        log.info('Reply received: YES')
+                        return 'YES'
+                    elif 'NO' in body_upper:
+                        mail.store(latest_id, '+FLAGS', '\\Seen')
+                        mail.logout()
+                        log.info('Reply received: NO')
+                        return 'NO'
+
+                mail.logout()
+            except Exception as e:
+                log.warning(f'Email poll error: {e}')
+
+        log.warning('No reply within timeout — auto-skipping')
+        return 'TIMEOUT'
+
+
+# ── Blinkit automation ────────────────────────────────────────────────────────
+
+def _build_driver(headless: bool = False, use_existing_profile: bool = False) -> webdriver.Chrome:
+    """
+    headless=False so you can see the browser open and add to cart.
+    use_existing_profile=True to connect to already running Chrome with Blinkit logged in
+    """
+    opts = Options()
+    
+    if use_existing_profile:
+        # Connect to existing Chrome instance
+        opts.add_experimental_option("debuggerAddress", "127.0.0.1:9222")
+    else:
+        if headless:
+            opts.add_argument('--headless=new')
+        opts.add_argument('--no-sandbox')
+        opts.add_argument('--disable-dev-shm-usage')
+        opts.add_argument('--disable-blink-features=AutomationControlled')
+        opts.add_experimental_option('excludeSwitches', ['enable-automation'])
+        opts.add_experimental_option('useAutomationExtension', False)
+        opts.add_argument('--window-size=1280,900')
+        opts.add_argument(
+            'user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+            'AppleWebKit/537.36 (KHTML, like Gecko) '
+            'Chrome/124.0.0.0 Safari/537.36'
+        )
+    
+    try:
+        if use_existing_profile:
+            # Try to connect to existing Chrome instance
+            driver = webdriver.Chrome(options=opts)
+        else:
+            service = Service(ChromeDriverManager().install())
+            driver = webdriver.Chrome(service=service, options=opts)
+            driver.execute_script(
+                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+            )
+        return driver
+    except Exception as e:
+        log.error(f"Failed to create driver: {e}")
+        if use_existing_profile:
+            log.info("Falling back to new browser instance...")
+            return _build_driver(headless=headless, use_existing_profile=False)
+        raise
+
+
+def find_existing_blinkit_tab(driver):
+    """Try to find and switch to existing Blinkit tab"""
+    try:
+        current_window = driver.current_window_handle
+        all_windows = driver.window_handles
+        
+        for window in all_windows:
+            driver.switch_to.window(window)
+            if "blinkit" in driver.current_url.lower():
+                log.info("Found existing Blinkit tab")
+                return True
+                
+        # Switch back to original window if no Blinkit tab found
+        driver.switch_to.window(current_window)
+        return False
+    except Exception as e:
+        log.warning(f"Error finding Blinkit tab: {e}")
+        return False
+
+
+class BlinkitCart:
+    def __init__(self, headless=False, use_existing=USE_EXISTING_WINDOW):
+        self.use_existing = use_existing
+        if use_existing:
+            log.info("Attempting to connect to existing Chrome window...")
+            self.driver = _build_driver(headless, use_existing_profile=True)
+        else:
+            log.info("Creating new browser instance...")
+            self.driver = _build_driver(headless)
+        self.wait = WebDriverWait(self.driver, 20)
+
+    def handle_location_setup(self):
+        """Handle initial location setup for new sessions"""
+        try:
+            # Wait for location input to appear
+            location_inputs = [
+                'input[placeholder*="search delivery location"]',
+                'input[placeholder*="location"]', 
+                'input[placeholder*="Search for area"]',
+                'input[placeholder*="Enter your location"]'
+            ]
+            
+            location_input = None
+            for selector in location_inputs:
+                try:
+                    location_input = self.wait.until(
+                        EC.element_to_be_clickable((By.CSS_SELECTOR, selector))
+                    )
+                    break
+                except TimeoutException:
+                    continue
+            
+            if location_input:
+                log.info("Found location input, setting location...")
+                location_input.clear()
+                location_input.send_keys("Indore")
+                time.sleep(2)
+                
+                # Look for suggestions
+                suggestion_selectors = [
+                    '[class*="suggestion"]',
+                    '[class*="Suggestion"]', 
+                    '[class*="LocationSearch"]',
+                    '.location-item',
+                    '.suggestion-item'
+                ]
+                
+                for selector in suggestion_selectors:
+                    try:
+                        suggestions = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                        if suggestions:
+                            suggestions[0].click()
+                            log.info("Selected location suggestion")
+                            time.sleep(3)
+                            return True
+                    except:
+                        continue
+                
+                # If no suggestions, press Enter
+                location_input.send_keys(Keys.RETURN)
+                time.sleep(3)
+                return True
+                
+        except Exception as e:
+            log.warning(f"Could not set location: {e}")
+        
+        return False
+
+    def open(self):
+        """Open Blinkit, handling existing windows or location popups"""
+        if self.use_existing:
+            # Try to find existing Blinkit tab
+            if find_existing_blinkit_tab(self.driver):
+                log.info('Using existing Blinkit tab')
+                # Refresh to ensure we're on main page
+                self.driver.refresh()
+                time.sleep(3)
+                return
+            else:
+                # Open new tab with Blinkit
+                self.driver.execute_script("window.open('');")
+                self.driver.switch_to.window(self.driver.window_handles[-1])
+        
+        # Navigate to Blinkit
+        self.driver.get(BLINKIT_BASE)
+        time.sleep(4)
+        
+        if not self.use_existing:
+            # Handle location setup for new sessions
+            self.handle_location_setup()
+            
+        log.info('Opened Blinkit')
+
+    def search_and_add(self, query: str) -> bool:
+        try:
+            log.info(f"Searching for: {query}")
+            
+            # Wait a bit for page to stabilize
+            time.sleep(3)
+            
+            # Enhanced search box detection with more comprehensive selectors
+            search_selectors = [
+                # Standard search inputs
+                'input[placeholder*="Search for"]',
+                'input[placeholder*="search for"]', 
+                'input[placeholder*="Search products"]',
+                'input[placeholder*="search products"]',
+                'input[type="search"]',
+                
+                # Class-based selectors
+                '[class*="SearchBar"] input',
+                '[class*="search-bar"] input',
+                '[class*="searchbar"] input',
+                '[class*="SearchInput"] input',
+                '[class*="search-input"] input',
+                
+                # Data attribute selectors
+                'input[data-testid*="search"]',
+                'input[data-cy*="search"]',
+                'input[id*="search"]',
+                
+                # Generic input search
+                '.search input',
+                '#search-input',
+                'input[name="search"]',
+                'input[name="query"]'
+            ]
+            
+            search_element = None
+            for selector in search_selectors:
+                try:
+                    elements = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                    for element in elements:
+                        if element.is_displayed() and element.is_enabled():
+                            search_element = element
+                            log.info(f"Found search box with selector: {selector}")
+                            break
+                    if search_element:
+                        break
+                except Exception as e:
+                    continue
+            
+            if not search_element:
+                # Try clicking on any clickable search area first
+                search_area_selectors = [
+                    '[class*="search-bar"]',
+                    '[class*="SearchBar"]',
+                    '.search-container',
+                    '[data-testid*="search"]'
+                ]
+                
+                for selector in search_area_selectors:
+                    try:
+                        area = self.driver.find_element(By.CSS_SELECTOR, selector)
+                        if area.is_displayed():
+                            area

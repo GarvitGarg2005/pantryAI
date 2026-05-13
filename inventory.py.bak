@@ -1,0 +1,229 @@
+"""
+inventory.py - Inventory Management for PantryAI
+----------------------------------------------
+Tracks item presence/absence and triggers reorder workflow.
+"""
+
+import sqlite3
+import time
+import json
+from datetime import datetime, timedelta
+
+DB_PATH = 'pantry.db'
+
+class InventoryManager:
+    def __init__(self):
+        self.conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+        self._create_tables()
+        self.reorder_queue = []
+        self.reorder_cooldown = 180  # 3 minutes between reorders for same item
+
+    def _create_tables(self):
+        """Create database tables if they don't exist"""
+        self.conn.execute('''
+            CREATE TABLE IF NOT EXISTS items (
+                item_name TEXT PRIMARY KEY,
+                status TEXT DEFAULT 'present',
+                last_seen REAL,
+                last_reorder_time REAL DEFAULT 0,
+                reorder_count INTEGER DEFAULT 0,
+                blinkit_search TEXT
+            )
+        ''')
+        
+        self.conn.execute('''
+            CREATE TABLE IF NOT EXISTS reorder_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                item_name TEXT,
+                timestamp TEXT,
+                trigger_reason TEXT,
+                status TEXT DEFAULT 'pending'
+            )
+        ''')
+        
+        self.conn.commit()
+
+    def mark_adequate_stock(self, item_name: str, level: int = 100):
+        """Mark item as present/adequate stock"""
+        now = time.time()
+        
+        self.conn.execute('''
+            INSERT INTO items (item_name, status, last_seen)
+            VALUES (?, 'present', ?)
+            ON CONFLICT(item_name) DO UPDATE SET
+                status = 'present',
+                last_seen = ?
+        ''', (item_name, now, now))
+        
+        self.conn.commit()
+
+    def mark_low_stock(self, item_name: str, level: int, blinkit_search: str):
+        """Mark item as absent/low stock and potentially trigger reorder"""
+        now = time.time()
+        
+        # Update item status
+        self.conn.execute('''
+            INSERT INTO items (item_name, status, blinkit_search)
+            VALUES (?, 'absent', ?)
+            ON CONFLICT(item_name) DO UPDATE SET
+                status = 'absent',
+                blinkit_search = ?
+        ''', (item_name, blinkit_search, blinkit_search))
+        
+        self.conn.commit()
+        
+        # Check if we should trigger a reorder
+        if self._should_trigger_reorder(item_name):
+            self._trigger_reorder(item_name, blinkit_search)
+
+    def _should_trigger_reorder(self, item_name: str) -> bool:
+        """Check if enough time has passed since last reorder attempt"""
+        cursor = self.conn.execute('''
+            SELECT last_reorder_time FROM items WHERE item_name = ?
+        ''', (item_name,))
+        
+        row = cursor.fetchone()
+        if not row:
+            return True
+        
+        last_reorder = row[0] or 0
+        return (time.time() - last_reorder) > self.reorder_cooldown
+
+    def _trigger_reorder(self, item_name: str, blinkit_search: str):
+        """Add item to reorder queue and log the event"""
+        now = time.time()
+        timestamp = datetime.now().isoformat()
+        
+        print(f"🚨 REORDER TRIGGERED: {item_name}")
+        
+        # Add to reorder queue if not already there
+        if item_name not in self.reorder_queue:
+            self.reorder_queue.append(item_name)
+        
+        # Log the reorder trigger
+        self.conn.execute('''
+            INSERT INTO reorder_log (item_name, timestamp, trigger_reason)
+            VALUES (?, ?, 'item_absent')
+        ''', (item_name, timestamp))
+        
+        # Update last reorder time
+        self.conn.execute('''
+            UPDATE items 
+            SET last_reorder_time = ?, reorder_count = reorder_count + 1
+            WHERE item_name = ?
+        ''', (now, item_name))
+        
+        self.conn.commit()
+
+    def pop_reorder_queue(self):
+        """Get next item from reorder queue"""
+        if self.reorder_queue:
+            return self.reorder_queue.pop(0)
+        return None
+
+    def mark_reorder_completed(self, item_name: str):
+        """Mark reorder as completed"""
+        self.conn.execute('''
+            UPDATE reorder_log 
+            SET status = 'completed'
+            WHERE item_name = ? AND status = 'pending'
+            ORDER BY id DESC LIMIT 1
+        ''', (item_name,))
+        self.conn.commit()
+        print(f"✅ Reorder completed for {item_name}")
+
+    def mark_reorder_failed(self, item_name: str):
+        """Mark reorder as failed"""
+        self.conn.execute('''
+            UPDATE reorder_log 
+            SET status = 'failed'
+            WHERE item_name = ? AND status = 'pending'
+            ORDER BY id DESC LIMIT 1
+        ''', (item_name,))
+        self.conn.commit()
+        print(f"❌ Reorder failed for {item_name}")
+
+    def get_all_items(self):
+        """Get all tracked items with their current status"""
+        cursor = self.conn.execute('''
+            SELECT item_name, status, last_seen, blinkit_search, reorder_count
+            FROM items
+            ORDER BY status DESC, item_name
+        ''')
+        
+        items = []
+        for row in cursor.fetchall():
+            items.append({
+                'name': row[0],
+                'status': row[1],
+                'last_seen': row[2] or 0,
+                'blinkit_search': row[3] or '',
+                'reorder_count': row[4] or 0,
+                'needs_reorder': row[1] == 'absent'
+            })
+        
+        return items
+
+    def get_reorder_log(self, limit: int = 20):
+        """Get recent reorder history"""
+        cursor = self.conn.execute('''
+            SELECT item_name, timestamp, trigger_reason, status
+            FROM reorder_log
+            ORDER BY id DESC
+            LIMIT ?
+        ''', (limit,))
+        
+        log_entries = []
+        for row in cursor.fetchall():
+            log_entries.append({
+                'item': row[0],
+                'time': row[1],
+                'trigger': row[2],
+                'status': row[3]
+            })
+        
+        return log_entries
+
+    def get_snapshot(self):
+        """Get current inventory snapshot for dashboard"""
+        items = self.get_all_items()
+        snapshot = {}
+        
+        for item in items:
+            snapshot[item['name']] = {
+                'status': item['status'],
+                'absent_for': int(time.time() - item['last_seen']) if item['last_seen'] else 999,
+                'reorder_flag': item['needs_reorder'],
+                'qty_pct': 0 if item['status'] == 'absent' else 100
+            }
+        
+        return snapshot
+
+    def get_dashboard_data(self):
+        """Get formatted data for web dashboard"""
+        items = self.get_all_items()
+        reorder_log = self.get_reorder_log(10)
+        
+        # Calculate stats
+        total_items = len(items)
+        absent_items = len([i for i in items if i['status'] == 'absent'])
+        
+        return {
+            'items': items,
+            'reorder_log': reorder_log,
+            'stats': {
+                'total_items': total_items,
+                'absent_items': absent_items,
+                'present_items': total_items - absent_items,
+                'pending_reorders': len(self.reorder_queue)
+            }
+        }
+
+    # Legacy compatibility methods
+    def mark_reordered(self, item_name: str):
+        """Legacy method for compatibility"""
+        self.mark_reorder_completed(item_name)
+
+    def tick(self):
+        """Legacy tick method - no longer needed"""
+        pass
