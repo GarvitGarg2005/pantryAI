@@ -1,0 +1,642 @@
+"""
+reorder.py  –  Pantry-AI reorder module
+-----------------------------------------
+Flow:
+  1. Item detected as absent long enough → reorder_queue populated
+  2. Opens Blinkit in Chrome via Selenium → searches item → adds to cart
+  3. Sends confirmation email to your Gmail
+  4. You reply YES/NO (polls your inbox for reply)
+  5. YES → proceeds to checkout page | NO → removes from cart
+
+Environment variables (create a .env file in project root):
+    GMAIL_SENDER=yourname@gmail.com
+    GMAIL_APP_PASSWORD=xxxx xxxx xxxx xxxx   ← 16-char Gmail App Password
+    NOTIFY_EMAIL=yourname@gmail.com           ← where to send alerts (can be same)
+
+To get a Gmail App Password:
+    1. Go to https://myaccount.google.com/security
+    2. Enable 2-Step Verification
+    3. Search "App passwords" → create one named "PantryAI"
+    4. Copy the 16-char password into .env
+
+Dependencies:
+    pip install selenium webdriver-manager python-dotenv
+"""
+
+import os
+import time
+import threading
+import logging
+import smtplib
+import imaplib
+import email
+import re
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from datetime import datetime
+from dotenv import load_dotenv
+
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException, NoSuchElementException
+from webdriver_manager.chrome import ChromeDriverManager
+
+load_dotenv()
+logging.basicConfig(level=logging.INFO, format='[REORDER] %(asctime)s %(message)s')
+log = logging.getLogger(__name__)
+
+# ── Config ────────────────────────────────────────────────────────────────────
+
+GMAIL_SENDER    = os.getenv('GMAIL_SENDER', '')
+GMAIL_PASSWORD  = os.getenv('GMAIL_APP_PASSWORD', '')
+NOTIFY_EMAIL    = os.getenv('NOTIFY_EMAIL', GMAIL_SENDER)
+REPLY_TIMEOUT   = 300   # seconds to wait for YES/NO reply email
+
+BLINKIT_BASE    = 'https://blinkit.com'
+
+# Set this to True to use existing window, False to handle location popup
+USE_EXISTING_WINDOW = True  # Change this to False if you want to handle location popup instead
+
+# Maps friendly item names → Blinkit search queries
+ITEM_SEARCH_MAP = {
+    'Water Bottle':  'water bottle 1L',
+    'Water Bottles': 'water bottle 1L',
+    'TV Remote':     'tv remote universal',
+    'Clock':         'wall clock',
+    'Cup':           'disposable cups',
+    'Bowl':          'instant noodles bowl',
+    'Notebook':      'notebook a4',
+    'Jar':           'glass jar',
+    'Scissors':      'scissors',
+    'Banana':        'banana',
+    'Apple':         'apple',
+    'Orange':        'orange',
+    'Carrot':        'carrot 500g',
+    'Biscuit Packet':'parle g biscuit',
+    'Biscuit Packets':'parle g biscuit',
+    'Rice Container': 'basmati rice 1kg',
+    'Pulses Container': 'toor dal 1kg',
+}
+
+
+# ── Gmail helpers ─────────────────────────────────────────────────────────────
+
+class EmailNotifier:
+    def __init__(self):
+        if not GMAIL_SENDER or not GMAIL_PASSWORD:
+            raise EnvironmentError(
+                'Gmail credentials missing. Add GMAIL_SENDER and '
+                'GMAIL_APP_PASSWORD to your .env file.'
+            )
+
+    def send(self, subject: str, body: str):
+        msg = MIMEMultipart()
+        msg['From']    = GMAIL_SENDER
+        msg['To']      = NOTIFY_EMAIL
+        msg['Subject'] = subject
+        msg.attach(MIMEText(body, 'plain'))
+
+        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
+            server.login(GMAIL_SENDER, GMAIL_PASSWORD)
+            server.send_message(msg)
+        log.info(f'Email sent: {subject}')
+
+    def wait_for_reply(self, subject_keyword: str, timeout: int = REPLY_TIMEOUT) -> str:
+        """
+        Poll Gmail inbox for a reply containing YES or NO.
+        subject_keyword: unique string to identify the reply thread.
+        Returns 'YES', 'NO', or 'TIMEOUT'.
+        """
+        deadline = time.time() + timeout
+        log.info(f'Waiting up to {timeout}s for email reply…')
+
+        while time.time() < deadline:
+            time.sleep(15)
+            try:
+                mail = imaplib.IMAP4_SSL('imap.gmail.com')
+                mail.login(GMAIL_SENDER, GMAIL_PASSWORD)
+                mail.select('inbox')
+
+                # Search for unread emails with our keyword in subject
+                _, data = mail.search(None, f'(UNSEEN SUBJECT "{subject_keyword}")')
+                ids = data[0].split()
+
+                if ids:
+                    latest_id = ids[-1]
+                    _, msg_data = mail.fetch(latest_id, '(RFC822)')
+                    raw = msg_data[0][1]
+                    msg = email.message_from_bytes(raw)
+
+                    body = ''
+                    if msg.is_multipart():
+                        for part in msg.walk():
+                            if part.get_content_type() == 'text/plain':
+                                body = part.get_payload(decode=True).decode()
+                                break
+                    else:
+                        body = msg.get_payload(decode=True).decode()
+
+                    body_upper = body.strip().upper()
+                    if 'YES' in body_upper:
+                        mail.store(latest_id, '+FLAGS', '\\Seen')
+                        mail.logout()
+                        log.info('Reply received: YES')
+                        return 'YES'
+                    elif 'NO' in body_upper:
+                        mail.store(latest_id, '+FLAGS', '\\Seen')
+                        mail.logout()
+                        log.info('Reply received: NO')
+                        return 'NO'
+
+                mail.logout()
+            except Exception as e:
+                log.warning(f'Email poll error: {e}')
+
+        log.warning('No reply within timeout — auto-skipping')
+        return 'TIMEOUT'
+
+
+# ── Blinkit automation ────────────────────────────────────────────────────────
+
+def _build_driver(headless: bool = False, use_existing_profile: bool = False) -> webdriver.Chrome:
+    """
+    headless=False so you can see the browser open and add to cart.
+    use_existing_profile=True to connect to already running Chrome with Blinkit logged in
+    """
+    opts = Options()
+    
+    if use_existing_profile:
+        # Connect to existing Chrome instance
+        opts.add_experimental_option("debuggerAddress", "127.0.0.1:9222")
+    else:
+        if headless:
+            opts.add_argument('--headless=new')
+        opts.add_argument('--no-sandbox')
+        opts.add_argument('--disable-dev-shm-usage')
+        opts.add_argument('--disable-blink-features=AutomationControlled')
+        opts.add_experimental_option('excludeSwitches', ['enable-automation'])
+        opts.add_experimental_option('useAutomationExtension', False)
+        opts.add_argument('--window-size=1280,900')
+        opts.add_argument(
+            'user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+            'AppleWebKit/537.36 (KHTML, like Gecko) '
+            'Chrome/124.0.0.0 Safari/537.36'
+        )
+    
+    try:
+        if use_existing_profile:
+            # Try to connect to existing Chrome instance
+            driver = webdriver.Chrome(options=opts)
+        else:
+            service = Service(ChromeDriverManager().install())
+            driver = webdriver.Chrome(service=service, options=opts)
+            driver.execute_script(
+                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+            )
+        return driver
+    except Exception as e:
+        log.error(f"Failed to create driver: {e}")
+        if use_existing_profile:
+            log.info("Falling back to new browser instance...")
+            return _build_driver(headless=headless, use_existing_profile=False)
+        raise
+
+
+def find_existing_blinkit_tab(driver):
+    """Try to find and switch to existing Blinkit tab"""
+    try:
+        current_window = driver.current_window_handle
+        all_windows = driver.window_handles
+        
+        for window in all_windows:
+            driver.switch_to.window(window)
+            if "blinkit" in driver.current_url.lower():
+                log.info("Found existing Blinkit tab")
+                return True
+                
+        # Switch back to original window if no Blinkit tab found
+        driver.switch_to.window(current_window)
+        return False
+    except Exception as e:
+        log.warning(f"Error finding Blinkit tab: {e}")
+        return False
+
+
+class BlinkitCart:
+    def __init__(self, headless=False, use_existing=USE_EXISTING_WINDOW):
+        self.use_existing = use_existing
+        if use_existing:
+            log.info("Attempting to connect to existing Chrome window...")
+            self.driver = _build_driver(headless, use_existing_profile=True)
+        else:
+            log.info("Creating new browser instance...")
+            self.driver = _build_driver(headless)
+        self.wait = WebDriverWait(self.driver, 20)
+
+    def handle_location_popup(self):
+        """Handle location permission popup on Blinkit"""
+        try:
+            # Wait a bit for popup to appear
+            time.sleep(3)
+            
+            # Try different location popup selectors
+            location_selectors = [
+                "//button[contains(text(), 'Allow')]",
+                "//button[contains(text(), 'Enable')]", 
+                "//button[contains(text(), 'Yes')]",
+                "//button[@aria-label='Allow location']",
+                "//div[contains(@class, 'location')]//button",
+                "[data-testid='location-allow']",
+                ".location-popup button",
+                "button[class*='allow']",
+                "button[class*='location']"
+            ]
+            
+            for selector in location_selectors:
+                try:
+                    if selector.startswith("//"):
+                        element = self.driver.find_element(By.XPATH, selector)
+                    else:
+                        element = self.driver.find_element(By.CSS_SELECTOR, selector)
+                    
+                    if element.is_displayed() and element.is_enabled():
+                        element.click()
+                        log.info(f"Clicked location permission using: {selector}")
+                        time.sleep(2)
+                        return True
+                except:
+                    continue
+            
+            # Try to dismiss any modal/overlay
+            dismiss_selectors = [
+                "//button[contains(@class, 'close')]",
+                "//div[@class='modal']//button",
+                ".modal-close",
+                "[data-testid='close']",
+                "button[aria-label='Close']"
+            ]
+            
+            for selector in dismiss_selectors:
+                try:
+                    if selector.startswith("//"):
+                        element = self.driver.find_element(By.XPATH, selector)
+                    else:
+                        element = self.driver.find_element(By.CSS_SELECTOR, selector)
+                    
+                    if element.is_displayed():
+                        element.click()
+                        log.info("Dismissed modal/popup")
+                        time.sleep(1)
+                        break
+                except:
+                    continue
+                    
+        except Exception as e:
+            log.warning(f"Could not handle location popup: {e}")
+        
+        return False
+
+    def open(self):
+        """Open Blinkit, handling existing windows or location popups"""
+        if self.use_existing:
+            # Try to find existing Blinkit tab
+            if find_existing_blinkit_tab(self.driver):
+                log.info('Using existing Blinkit tab')
+                # Refresh to ensure we're on main page
+                self.driver.refresh()
+                time.sleep(3)
+                return
+            else:
+                # Open new tab with Blinkit
+                self.driver.execute_script("window.open('');")
+                self.driver.switch_to.window(self.driver.window_handles[-1])
+        
+        # Navigate to Blinkit
+        self.driver.get(BLINKIT_BASE)
+        time.sleep(4)
+        
+        if not self.use_existing:
+            # Handle location popup for new sessions
+            self.handle_location_popup()
+            
+        log.info('Opened Blinkit')
+
+    def search_and_add(self, query: str) -> bool:
+        try:
+            # Handle any remaining popups
+            self.handle_location_popup()
+            
+            # Find search box with multiple selectors
+            search_selectors = [
+                'input[type="search"]',
+                'input[placeholder*="Search"]',
+                'input[placeholder*="search"]',
+                'input[data-testid="search"]',
+                '.search-input',
+                '#search-input',
+                'input[name="search"]'
+            ]
+            
+            search_element = None
+            for selector in search_selectors:
+                try:
+                    search_element = self.wait.until(
+                        EC.element_to_be_clickable((By.CSS_SELECTOR, selector))
+                    )
+                    break
+                except TimeoutException:
+                    continue
+            
+            if not search_element:
+                log.error("Could not find search box")
+                return False
+            
+            # Clear and search
+            search_element.clear()
+            time.sleep(1)
+            search_element.send_keys(query)
+            time.sleep(2)
+            search_element.send_keys(Keys.RETURN)
+            time.sleep(5)
+            
+            # Find add button with multiple selectors
+            add_selectors = [
+                '//button[contains(translate(text(),"add","ADD"),"ADD")]',
+                '//button[@aria-label="add to cart"]',
+                '//button[contains(@class,"add")]',
+                '.add-to-cart-btn',
+                'button[data-testid="add-to-cart"]',
+                '.product-card button',
+                '.add-btn'
+            ]
+            
+            add_button = None
+            for selector in add_selectors:
+                try:
+                    if selector.startswith("//"):
+                        add_button = self.wait.until(
+                            EC.element_to_be_clickable((By.XPATH, f"({selector})[1]"))
+                        )
+                    else:
+                        add_button = self.wait.until(
+                            EC.element_to_be_clickable((By.CSS_SELECTOR, selector))
+                        )
+                    break
+                except TimeoutException:
+                    continue
+            
+            if not add_button:
+                log.error(f"Could not find add button for: {query}")
+                return False
+                
+            # Scroll to button and click
+            self.driver.execute_script("arguments[0].scrollIntoView(true);", add_button)
+            time.sleep(1)
+            add_button.click()
+            time.sleep(2)
+            
+            log.info(f'Added "{query}" to Blinkit cart')
+            return True
+
+        except Exception as e:
+            log.warning(f'Could not add "{query}": {e}')
+            return False
+
+    def remove_last(self):
+        """Remove last item from cart"""
+        try:
+            remove_selectors = [
+                '//button[@aria-label="remove from cart"]',
+                '//button[contains(@class,"decrease")]',
+                '//button[contains(@class,"remove")]',
+                '.cart-item button[class*="remove"]',
+                '.quantity-controls button:first-child'
+            ]
+            
+            for selector in remove_selectors:
+                try:
+                    if selector.startswith("//"):
+                        element = self.driver.find_element(By.XPATH, f"({selector})[last()]")
+                    else:
+                        element = self.driver.find_element(By.CSS_SELECTOR, selector)
+                    element.click()
+                    log.info('Removed item from cart')
+                    return
+                except:
+                    continue
+                    
+            log.warning('Remove button not found')
+        except Exception as e:
+            log.warning(f'Error removing item: {e}')
+
+    def go_to_checkout(self):
+        """Navigate to checkout page"""
+        try:
+            checkout_selectors = [
+                '//button[contains(text(),"View Cart")]',
+                '//button[contains(text(),"Checkout")]',
+                '//button[contains(text(),"Proceed")]',
+                '.cart-button',
+                '[data-testid="cart-button"]',
+                '.checkout-btn'
+            ]
+            
+            for selector in checkout_selectors:
+                try:
+                    if selector.startswith("//"):
+                        btn = self.driver.find_element(By.XPATH, selector)
+                    else:
+                        btn = self.driver.find_element(By.CSS_SELECTOR, selector)
+                    btn.click()
+                    log.info('Moved to checkout')
+                    return
+                except:
+                    continue
+                    
+            log.warning('Checkout button not found — open manually')
+        except Exception as e:
+            log.warning(f'Error going to checkout: {e}')
+
+    def quit(self):
+        """Close the browser"""
+        if not self.use_existing:
+            self.driver.quit()
+        else:
+            log.info("Keeping existing browser window open")
+
+
+# ── ReorderEngine ─────────────────────────────────────────────────────────────
+
+class ReorderEngine:
+    def __init__(self, inventory_manager, headless_browser=False):
+        self.inv      = inventory_manager
+        self.headless = headless_browser
+        self.notifier = None
+        self._running = False
+        self._thread  = None
+
+    def _init_notifier(self):
+        if self.notifier is None:
+            try:
+                self.notifier = EmailNotifier()
+            except EnvironmentError as e:
+                log.error(str(e))
+
+    def process_item(self, item_name: str):
+        search_query = ITEM_SEARCH_MAP.get(item_name, item_name)
+        log.info(f'Reorder triggered: {item_name} → searching "{search_query}"')
+
+        subject_key = f'PantryAI-{item_name}-{int(time.time())}'
+
+        # 1. Send confirmation email
+        self._init_notifier()
+        if self.notifier:
+            self.notifier.send(
+                subject=f'[PantryAI] {subject_key} - Reorder Confirmation',
+                body=(
+                    f'PantryAI detected that "{item_name}" is running low in your pantry.\n\n'
+                    f'It will be searched on Blinkit as: "{search_query}"\n\n'
+                    f'Reply YES to add it to your Blinkit cart.\n'
+                    f'Reply NO to skip.\n\n'
+                    f'(Auto-skips in {REPLY_TIMEOUT // 60} minutes if no reply)'
+                )
+            )
+            reply = self.notifier.wait_for_reply(subject_key)
+        else:
+            log.warning('Email not configured — auto-approving for demo')
+            reply = 'YES'
+
+        if reply not in ('YES',):
+            log.info(f'Reorder skipped for {item_name} (reply: {reply})')
+            self.inv.mark_reordered(item_name)
+            return
+
+        # 2. Open Blinkit and add to cart
+        if USE_EXISTING_WINDOW:
+            log.info("Instructions:")
+            log.info("1. Open Chrome and run: chrome.exe --remote-debugging-port=9222")
+            log.info("2. Navigate to Blinkit and log in")
+            log.info("3. Keep the window open")
+            log.info("4. PantryAI will now use this window to add items")
+            
+        cart = BlinkitCart(headless=self.headless, use_existing=USE_EXISTING_WINDOW)
+        try:
+            cart.open()
+            success = cart.search_and_add(search_query)
+
+            if success:
+                log.info(f'"{item_name}" added to Blinkit cart')
+                if self.notifier:
+                    checkout_subject = f'PantryAI-checkout-{item_name}-{int(time.time())}'
+                    self.notifier.send(
+                        subject=f'[PantryAI] {checkout_subject} - Proceed to Checkout?',
+                        body=(
+                            f'"{item_name}" has been added to your Blinkit cart!\n\n'
+                            f'Reply YES to proceed to checkout.\n'
+                            f'Reply NO to review the cart manually.\n'
+                        )
+                    )
+                    checkout_reply = self.notifier.wait_for_reply(
+                        checkout_subject, timeout=120
+                    )
+                    if checkout_reply == 'YES':
+                        cart.go_to_checkout()
+                        if self.notifier:
+                            self.notifier.send(
+                                subject='[PantryAI] Checkout Opened',
+                                body='Blinkit checkout page is open. Complete payment in the browser.'
+                            )
+
+                self.inv.mark_reordered(item_name)
+
+            else:
+                log.warning(f'Could not auto-add {item_name} to cart')
+                if self.notifier:
+                    self.notifier.send(
+                        subject=f'[PantryAI] Manual Action Needed - {item_name}',
+                        body=(
+                            f'PantryAI could not automatically add "{item_name}" to Blinkit.\n'
+                            f'Please order it manually: {BLINKIT_BASE}\n'
+                            f'Search for: {search_query}'
+                        )
+                    )
+        except Exception as e:
+            log.error(f'Error processing {item_name}: {e}')
+        finally:
+            # Keep browser open longer if using existing window
+            if USE_EXISTING_WINDOW:
+                time.sleep(30)  # Shorter wait for existing window
+            else:
+                time.sleep(60)
+            cart.quit()
+
+    def _worker(self):
+        while self._running:
+            item = self.inv.pop_reorder_queue()
+            if item:
+                try:
+                    self.process_item(item)
+                except Exception as e:
+                    log.error(f'ReorderEngine error for {item}: {e}')
+            time.sleep(5)
+
+    def start(self):
+        self._running = True
+        self._thread  = threading.Thread(target=self._worker, daemon=True)
+        self._thread.start()
+        log.info('ReorderEngine started')
+        
+        if USE_EXISTING_WINDOW:
+            log.info("=" * 60)
+            log.info("SETUP REQUIRED FOR EXISTING WINDOW MODE:")
+            log.info("1. Close all Chrome windows")
+            log.info("2. Open Command Prompt/Terminal")
+            log.info("3. Run: chrome.exe --remote-debugging-port=9222")
+            log.info("   (On Mac: /Applications/Google\\ Chrome.app/Contents/MacOS/Google\\ Chrome --remote-debugging-port=9222)")
+            log.info("   (On Linux: google-chrome --remote-debugging-port=9222)")
+            log.info("4. Navigate to blinkit.com and log in")
+            log.info("5. Keep this window open - PantryAI will use it")
+            log.info("=" * 60)
+
+    def stop(self):
+        self._running = False
+        log.info('ReorderEngine stopped')
+
+
+# Helper function to start Chrome with debugging for existing window mode
+def start_chrome_for_debugging():
+    """
+    Helper function to start Chrome with remote debugging.
+    Run this before starting PantryAI if you want to use existing window mode.
+    """
+    import subprocess
+    import platform
+    
+    system = platform.system()
+    if system == "Windows":
+        cmd = "chrome.exe --remote-debugging-port=9222"
+    elif system == "Darwin":  # macOS
+        cmd = "/Applications/Google\\ Chrome.app/Contents/MacOS/Google\\ Chrome --remote-debugging-port=9222"
+    else:  # Linux
+        cmd = "google-chrome --remote-debugging-port=9222"
+    
+    try:
+        subprocess.Popen(cmd, shell=True)
+        print(f"Started Chrome with debugging on port 9222")
+        print("Navigate to blinkit.com and log in, then start PantryAI")
+    except Exception as e:
+        print(f"Error starting Chrome: {e}")
+        print("Please start Chrome manually with: --remote-debugging-port=9222")
+
+
+if __name__ == "__main__":
+    if USE_EXISTING_WINDOW:
+        print("Starting Chrome for debugging...")
+        start_chrome_for_debugging()
+    else:
+        print("Using new browser instance mode")
